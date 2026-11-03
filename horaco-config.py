@@ -72,22 +72,52 @@ SECRET_END = 0x4D  # exclusive
 
 
 # ============================================================================
+# Physical port PVID table
+# ============================================================================
+#
+# Verified against the WebUI on:
+#
+#   HORACO ZX-AFGW-SWTG218ANS-150
+#   HW V1.0
+#   FW V100.9.9
+#
+# Nine front-panel ports are stored sequentially as uint16 big-endian values.
+#
+# Observed configuration:
+#
+#   Port 1 = 60
+#   Port 2 = 60
+#   Port 3 = 60
+#   Port 4 = 60
+#   Port 5 = 60
+#   Port 6 = 1
+#   Port 7 = 11
+#   Port 8 = 11
+#   Port 9 = 11
+#
+# PVIDs on RTL8373 are 12-bit values, so the valid numeric range is 0..4095.
+# ============================================================================
+
+PVID_OFFSET = 0x4CC
+PVID_COUNT = 9
+
+
+# ============================================================================
 # Unknown VLAN-related table
 # ============================================================================
 #
 # Earlier versions of this decoder incorrectly identified this structure as
 # the physical-port PVID table.
 #
-# That interpretation has been disproven by comparison with the switch WebUI.
+# The real physical-port PVID table has now been identified at 0x04CC.
 #
-# On one observed configuration this table contains:
+# On one observed configuration this unknown table contains:
 #
 #   1, 1, 60, 11, 70, 50, 40, 80, 14
 #
 # Those values correlate strongly with configured VLAN IDs, but the exact
-# purpose and semantics of the table remain unknown.
+# purpose and semantics of this table remain unknown.
 #
-# IMPORTANT:
 # Values of 0xFFFF have been observed in unused entries, so these must be
 # treated as generic unsigned 16-bit values rather than VLAN IDs.
 # ============================================================================
@@ -141,7 +171,6 @@ def sha256(data):
 
 def load_bin(path):
     path = Path(path)
-
     data = path.read_bytes()
 
     if len(data) != EXPECTED_SIZE:
@@ -284,10 +313,6 @@ def decode(path, outdir):
     # ------------------------------------------------------------------------
     # Sanitized binary template
     # ------------------------------------------------------------------------
-    #
-    # Everything is preserved byte-for-byte except the sensitive account
-    # region, which is zeroed.
-    # ------------------------------------------------------------------------
 
     template = bytearray(data)
 
@@ -348,6 +373,39 @@ def decode(path, outdir):
 
 
     # ------------------------------------------------------------------------
+    # Physical port PVID table
+    # ------------------------------------------------------------------------
+
+    pvids = []
+
+    for i in range(PVID_COUNT):
+
+        pos = (
+            PVID_OFFSET
+            + i * 2
+        )
+
+        value = int.from_bytes(
+            data[
+                pos:
+                pos + 2
+            ],
+            byteorder="big",
+        )
+
+        pvids.append({
+            "port":
+                i + 1,
+
+            "offset":
+                f"0x{pos:04x}",
+
+            "pvid":
+                value,
+        })
+
+
+    # ------------------------------------------------------------------------
     # Unknown VLAN-related 16-bit table
     # ------------------------------------------------------------------------
 
@@ -356,20 +414,29 @@ def decode(path, outdir):
     for i in range(
         UNKNOWN_VLAN_TABLE_COUNT
     ):
+
         pos = (
             UNKNOWN_VLAN_TABLE_OFFSET
             + i * 2
         )
 
         value = int.from_bytes(
-            data[pos:pos + 2],
+            data[
+                pos:
+                pos + 2
+            ],
             byteorder="big",
         )
 
         unknown_vlan_id_table.append({
-            "raw_index": i,
-            "offset": f"0x{pos:04x}",
-            "value": value,
+            "raw_index":
+                i,
+
+            "offset":
+                f"0x{pos:04x}",
+
+            "value":
+                value,
         })
 
 
@@ -443,6 +510,11 @@ def decode(path, outdir):
         "management":
             management,
 
+        "ports": {
+            "pvid":
+                pvids,
+        },
+
         "unknown": {
             "vlan_id_table":
                 unknown_vlan_id_table,
@@ -464,15 +536,15 @@ def decode(path, outdir):
             ),
 
             (
-                "The 16-bit table beginning at 0x0530 was "
-                "previously misidentified as the physical-port "
-                "PVID table. Its meaning is currently unknown."
+                "Physical-port PVIDs are stored as nine "
+                "sequential uint16 big-endian values "
+                "beginning at offset 0x04CC."
             ),
 
             (
-                "The switch WebUI reports physical port PVIDs "
-                "independently of the values found in the "
-                "0x0530 table."
+                "The 16-bit table beginning at 0x0530 was "
+                "previously misidentified as the physical-port "
+                "PVID table. Its meaning is currently unknown."
             ),
 
             (
@@ -689,6 +761,56 @@ def encode(indir, outfile):
 
 
     # ------------------------------------------------------------------------
+    # Physical port PVIDs
+    # ------------------------------------------------------------------------
+
+    pvids = (
+        config[
+            "ports"
+        ][
+            "pvid"
+        ]
+    )
+
+    if len(pvids) != PVID_COUNT:
+        raise ValueError(
+            f"Expected "
+            f"{PVID_COUNT} "
+            f"port PVID entries; "
+            f"got {len(pvids)}"
+        )
+
+
+    for i, entry in enumerate(
+        pvids
+    ):
+
+        value = int(
+            entry["pvid"]
+        )
+
+        if not 0 <= value <= 4095:
+            raise ValueError(
+                f"Invalid PVID "
+                f"{value} for "
+                f"port {i + 1}"
+            )
+
+        pos = (
+            PVID_OFFSET
+            + i * 2
+        )
+
+        data[
+            pos:
+            pos + 2
+        ] = value.to_bytes(
+            2,
+            byteorder="big",
+        )
+
+
+    # ------------------------------------------------------------------------
     # Unknown VLAN-related table
     # ------------------------------------------------------------------------
 
@@ -715,6 +837,7 @@ def encode(indir, outfile):
     for i, entry in enumerate(
         entries
     ):
+
         value = int(
             entry["value"]
         )
@@ -760,6 +883,7 @@ def encode(indir, outfile):
     for i, vlan in enumerate(
         vlans
     ):
+
         pos = (
             VLAN_OFFSET
             + i * VLAN_RECORD_SIZE
