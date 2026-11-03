@@ -16,140 +16,35 @@ from pathlib import Path
 #   Hardware: V1.0
 #   Firmware: V100.9.9
 #
-# Observed configuration backup size:
+# Observed backup size:
 #   2667 bytes
 #
-# IMPORTANT:
-# Other HORACO models, hardware revisions, and firmware revisions may use
-# different layouts.
-#
-# Only fields that have been reasonably verified are given semantic names.
-# Unknown structures are deliberately preserved without guessing their meaning.
+# Only fields verified against real switch configuration are given semantic
+# names. Unknown data is preserved exactly wherever possible.
 # ============================================================================
 
 
 EXPECTED_SIZE = 2667
 MAGIC = b"#y#y"
 
-
-# ============================================================================
-# Known management configuration
-# ============================================================================
-
-# Byte 0x04:
-#   Observed 0 = DHCP disabled
-#   Observed 1 = DHCP enabled
 DHCP_OFFSET = 0x04
-
-# IPv4 fields
 IP_OFFSET = 0x05
 MASK_OFFSET = 0x09
 GW_OFFSET = 0x0D
 
-
-# ============================================================================
-# Sensitive account / credential area
-# ============================================================================
-#
-# This region contains account-related data and should be considered sensitive.
-#
-# The decoder does NOT expose it in config.json.
-#
-# Instead:
-#
-#   secrets.bin
-#       contains the original bytes
-#       DO NOT COMMIT
-#
-#   template.bin
-#       contains the full configuration with this region replaced by zeroes
-#
-# The encoder re-inserts secrets.bin during reconstruction.
-# ============================================================================
-
 SECRET_START = 0x17
-SECRET_END = 0x4D  # exclusive
+SECRET_END = 0x4D
 
-
-# ============================================================================
-# Physical port PVID table
-# ============================================================================
-#
-# Verified against the WebUI on:
-#
-#   HORACO ZX-AFGW-SWTG218ANS-150
-#   HW V1.0
-#   FW V100.9.9
-#
-# Nine front-panel ports are stored sequentially as uint16 big-endian values.
-#
-# Observed configuration:
-#
-#   Port 1 = 60
-#   Port 2 = 60
-#   Port 3 = 60
-#   Port 4 = 60
-#   Port 5 = 60
-#   Port 6 = 1
-#   Port 7 = 11
-#   Port 8 = 11
-#   Port 9 = 11
-#
-# PVIDs on RTL8373 are 12-bit values, so the valid numeric range is 0..4095.
-# ============================================================================
-
+# Verified physical front-panel PVIDs.
+# Nine uint16 big-endian values corresponding to ports 1..9.
 PVID_OFFSET = 0x4CC
 PVID_COUNT = 9
 
-
-# ============================================================================
-# Unknown VLAN-related table
-# ============================================================================
-#
-# Earlier versions of this decoder incorrectly identified this structure as
-# the physical-port PVID table.
-#
-# The real physical-port PVID table has now been identified at 0x04CC.
-#
-# On one observed configuration this unknown table contains:
-#
-#   1, 1, 60, 11, 70, 50, 40, 80, 14
-#
-# Those values correlate strongly with configured VLAN IDs, but the exact
-# purpose and semantics of this table remain unknown.
-#
-# Values of 0xFFFF have been observed in unused entries, so these must be
-# treated as generic unsigned 16-bit values rather than VLAN IDs.
-# ============================================================================
-
+# Unknown 16-bit table. Do not interpret as PVIDs.
 UNKNOWN_VLAN_TABLE_OFFSET = 0x530
 UNKNOWN_VLAN_TABLE_COUNT = 9
 
-
-# ============================================================================
-# VLAN records
-# ============================================================================
-#
-# Verified record geometry:
-#
-#   record size: 26 bytes
-#
-#   +0x00  uint16 BE   VLAN ID
-#   +0x02  char[16]    VLAN name, NUL padded
-#   +0x12  byte[8]     unknown metadata
-#
-# Known example:
-#
-#   VLAN 60 CAMERA
-#
-#   00 3c
-#   43 41 4d 45 52 41 00 00 00 00 00 00 00 00 00 00
-#   00 01 df 00 00 01 c0 01
-#
-# The final 8 bytes appear related to VLAN configuration, but are intentionally
-# left uninterpreted until their semantics can be verified.
-# ============================================================================
-
+# Verified VLAN record layout.
 VLAN_OFFSET = 0x58E
 VLAN_RECORD_SIZE = 26
 VLAN_RECORD_COUNT = 7
@@ -160,10 +55,18 @@ NAME_LEN = 16
 META_OFFSET = 18
 META_LEN = 8
 
+# Verified by controlled VLAN changes:
+#
+# Each 8-byte VLAN metadata field consists of two BE uint32 words.
+# Front-panel port bits 1..9 occupy word bits 8..16.
+#
+#   metadata[0:4] : member word
+#   metadata[4:8] : tagged word
+#
+# All bits outside this mask remain unidentified and MUST be preserved.
+VLAN_PORT_MASK = 0x1FF
+VLAN_PORT_WORD_MASK = VLAN_PORT_MASK << 8
 
-# ============================================================================
-# Utility functions
-# ============================================================================
 
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
@@ -189,50 +92,87 @@ def load_bin(path):
 
 
 def ipv4(raw):
-    return str(
-        ipaddress.IPv4Address(
-            bytes(raw)
-        )
-    )
+    return str(ipaddress.IPv4Address(bytes(raw)))
 
 
 def ipv4_bytes(address):
-    return ipaddress.IPv4Address(
-        address
-    ).packed
+    return ipaddress.IPv4Address(address).packed
 
 
-def parse_hex_metadata(value):
-    try:
-        raw = bytes.fromhex(value)
+def ports_from_mask(mask):
+    return [
+        port
+        for port in range(1, 10)
+        if mask & (1 << (port - 1))
+    ]
 
-    except ValueError as exc:
+
+def mask_from_ports(ports, field_name):
+    mask = 0
+    seen = set()
+
+    if not isinstance(ports, list):
         raise ValueError(
-            f"Invalid metadata_hex value: {value!r}"
-        ) from exc
-
-    if len(raw) != META_LEN:
-        raise ValueError(
-            f"VLAN metadata must be exactly "
-            f"{META_LEN} bytes; got {len(raw)}"
+            f"{field_name} must be a JSON list of port numbers"
         )
 
-    return raw
+    for raw_port in ports:
+        if isinstance(raw_port, bool):
+            raise ValueError(
+                f"{field_name} contains invalid port {raw_port!r}"
+            )
+
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{field_name} contains invalid port {raw_port!r}"
+            ) from exc
+
+        if port < 1 or port > 9:
+            raise ValueError(
+                f"{field_name} port {port} is outside valid range 1..9"
+            )
+
+        if port in seen:
+            raise ValueError(
+                f"{field_name} contains duplicate port {port}"
+            )
+
+        seen.add(port)
+        mask |= 1 << (port - 1)
+
+    return mask
 
 
-# ============================================================================
-# VLAN decoding
-# ============================================================================
+def parse_word(value, field_name):
+    if isinstance(value, int):
+        word = value
+
+    elif isinstance(value, str):
+        try:
+            word = int(value, 0)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid {field_name}: {value!r}"
+            ) from exc
+
+    else:
+        raise ValueError(
+            f"{field_name} must be an integer or 0x-prefixed string"
+        )
+
+    if not 0 <= word <= 0xFFFFFFFF:
+        raise ValueError(
+            f"{field_name} is outside uint32 range: {word}"
+        )
+
+    return word
+
 
 def decode_vlan_record(data, index):
-    pos = (
-        VLAN_OFFSET
-        + index * VLAN_RECORD_SIZE
-    )
-
-    rec = data[
-        pos:pos + VLAN_RECORD_SIZE
-    ]
+    pos = VLAN_OFFSET + index * VLAN_RECORD_SIZE
+    rec = data[pos:pos + VLAN_RECORD_SIZE]
 
     if len(rec) != VLAN_RECORD_SIZE:
         raise ValueError(
@@ -241,10 +181,7 @@ def decode_vlan_record(data, index):
         )
 
     vid = int.from_bytes(
-        rec[
-            VID_OFFSET:
-            VID_OFFSET + 2
-        ],
+        rec[VID_OFFSET:VID_OFFSET + 2],
         byteorder="big",
     )
 
@@ -256,10 +193,7 @@ def decode_vlan_record(data, index):
     name = (
         name_raw
         .split(b"\x00", 1)[0]
-        .decode(
-            "ascii",
-            errors="replace",
-        )
+        .decode("ascii", errors="replace")
     )
 
     metadata = rec[
@@ -267,33 +201,68 @@ def decode_vlan_record(data, index):
         META_OFFSET + META_LEN
     ]
 
+    member_word = int.from_bytes(
+        metadata[0:4],
+        byteorder="big",
+    )
+
+    tagged_word = int.from_bytes(
+        metadata[4:8],
+        byteorder="big",
+    )
+
+    member_mask = (
+        member_word >> 8
+    ) & VLAN_PORT_MASK
+
+    tagged_mask = (
+        tagged_word >> 8
+    ) & VLAN_PORT_MASK
+
+    untagged_mask = (
+        member_mask
+        & ~tagged_mask
+        & VLAN_PORT_MASK
+    )
+
     return {
         "index": index,
         "offset": f"0x{pos:04x}",
         "id": vid,
         "name": name,
-        "metadata_hex": metadata.hex(),
+
+        "members":
+            ports_from_mask(member_mask),
+
+        "tagged":
+            ports_from_mask(tagged_mask),
+
+        "untagged":
+            ports_from_mask(untagged_mask),
+
+        "metadata_preserved": {
+            "member_word":
+                f"0x{member_word:08x}",
+
+            "tagged_word":
+                f"0x{tagged_word:08x}",
+        },
+
         "raw_hex": rec.hex(),
     }
 
-
-# ============================================================================
-# Decode
-# ============================================================================
 
 def decode(path, outdir):
     data = load_bin(path)
 
     outdir = Path(outdir)
-
     outdir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-
     # ------------------------------------------------------------------------
-    # Sensitive account region
+    # Sensitive region
     # ------------------------------------------------------------------------
 
     secret = data[
@@ -308,7 +277,6 @@ def decode(path, outdir):
     secret_path.write_bytes(
         secret
     )
-
 
     # ------------------------------------------------------------------------
     # Sanitized binary template
@@ -332,9 +300,8 @@ def decode(path, outdir):
         template
     )
 
-
     # ------------------------------------------------------------------------
-    # Management configuration
+    # Management
     # ------------------------------------------------------------------------
 
     management = {
@@ -342,9 +309,7 @@ def decode(path, outdir):
             data[DHCP_OFFSET],
 
         "dhcp":
-            bool(
-                data[DHCP_OFFSET]
-            ),
+            bool(data[DHCP_OFFSET]),
 
         "address":
             ipv4(
@@ -371,25 +336,20 @@ def decode(path, outdir):
             ),
     }
 
-
     # ------------------------------------------------------------------------
-    # Physical port PVID table
+    # Port PVIDs
     # ------------------------------------------------------------------------
 
     pvids = []
 
     for i in range(PVID_COUNT):
-
         pos = (
             PVID_OFFSET
             + i * 2
         )
 
         value = int.from_bytes(
-            data[
-                pos:
-                pos + 2
-            ],
+            data[pos:pos + 2],
             byteorder="big",
         )
 
@@ -404,9 +364,8 @@ def decode(path, outdir):
                 value,
         })
 
-
     # ------------------------------------------------------------------------
-    # Unknown VLAN-related 16-bit table
+    # Unknown VLAN-related table
     # ------------------------------------------------------------------------
 
     unknown_vlan_id_table = []
@@ -414,17 +373,13 @@ def decode(path, outdir):
     for i in range(
         UNKNOWN_VLAN_TABLE_COUNT
     ):
-
         pos = (
             UNKNOWN_VLAN_TABLE_OFFSET
             + i * 2
         )
 
         value = int.from_bytes(
-            data[
-                pos:
-                pos + 2
-            ],
+            data[pos:pos + 2],
             byteorder="big",
         )
 
@@ -439,27 +394,14 @@ def decode(path, outdir):
                 value,
         })
 
-
     # ------------------------------------------------------------------------
-    # VLAN records
+    # VLANs
     # ------------------------------------------------------------------------
 
-    vlans = []
-
-    for i in range(
-        VLAN_RECORD_COUNT
-    ):
-        vlans.append(
-            decode_vlan_record(
-                data,
-                i,
-            )
-        )
-
-
-    # ------------------------------------------------------------------------
-    # Human-readable configuration
-    # ------------------------------------------------------------------------
+    vlans = [
+        decode_vlan_record(data, i)
+        for i in range(VLAN_RECORD_COUNT)
+    ]
 
     config = {
         "device_profile": {
@@ -525,31 +467,38 @@ def decode(path, outdir):
 
         "notes": [
             (
-                "This format has been tested on a HORACO "
-                "ZX-AFGW-SWTG218ANS-150, hardware V1.0, "
-                "firmware V100.9.9."
+                "Tested on HORACO ZX-AFGW-SWTG218ANS-150, "
+                "hardware V1.0, firmware V100.9.9."
             ),
 
             (
-                "Other hardware and firmware revisions may "
+                "Other hardware or firmware revisions may "
                 "use different configuration layouts."
             ),
 
             (
-                "Physical-port PVIDs are stored as nine "
-                "sequential uint16 big-endian values "
-                "beginning at offset 0x04CC."
+                "Physical-port PVIDs are nine sequential "
+                "uint16 big-endian values beginning at 0x04CC."
             ),
 
             (
-                "The 16-bit table beginning at 0x0530 was "
-                "previously misidentified as the physical-port "
-                "PVID table. Its meaning is currently unknown."
+                "The 16-bit table beginning at 0x0530 remains "
+                "unidentified."
             ),
 
             (
-                "VLAN metadata is preserved exactly but has "
-                "not yet been interpreted."
+                "VLAN member and tagged port masks occupy "
+                "bits 8..16 of two preserved uint32 metadata words."
+            ),
+
+            (
+                "VLAN untagged ports are derived as "
+                "members minus tagged ports."
+            ),
+
+            (
+                "Unknown bits of both VLAN metadata words are "
+                "preserved during encoding."
             ),
 
             (
@@ -558,22 +507,11 @@ def decode(path, outdir):
             ),
 
             (
-                "template.bin contains the complete original "
-                "configuration except that the sensitive "
-                "account region has been zeroed."
-            ),
-
-            (
                 "Do not commit secrets.bin or reconstructed "
-                "uploadable configuration .bin files to Git."
+                "uploadable configuration BIN files."
             ),
         ],
     }
-
-
-    # ------------------------------------------------------------------------
-    # Write readable configuration
-    # ------------------------------------------------------------------------
 
     config_path = (
         outdir / "config.json"
@@ -586,11 +524,6 @@ def decode(path, outdir):
         )
         + "\n"
     )
-
-
-    # ------------------------------------------------------------------------
-    # Summary
-    # ------------------------------------------------------------------------
 
     print(
         f"Wrote: {config_path}"
@@ -605,10 +538,6 @@ def decode(path, outdir):
         "[SENSITIVE - DO NOT COMMIT]"
     )
 
-
-# ============================================================================
-# Encode
-# ============================================================================
 
 def encode(indir, outfile):
     indir = Path(indir)
@@ -625,11 +554,6 @@ def encode(indir, outfile):
         indir / "secrets.bin"
     )
 
-
-    # ------------------------------------------------------------------------
-    # Required files
-    # ------------------------------------------------------------------------
-
     if not config_path.exists():
         raise FileNotFoundError(
             config_path
@@ -643,14 +567,8 @@ def encode(indir, outfile):
     if not secret_path.exists():
         raise FileNotFoundError(
             f"{secret_path} is required "
-            "to reconstruct an uploadable "
-            "configuration."
+            "to reconstruct an uploadable configuration."
         )
-
-
-    # ------------------------------------------------------------------------
-    # Load representation
-    # ------------------------------------------------------------------------
 
     config = json.loads(
         config_path.read_text()
@@ -660,31 +578,20 @@ def encode(indir, outfile):
         template_path.read_bytes()
     )
 
-
-    # ------------------------------------------------------------------------
-    # Validate template
-    # ------------------------------------------------------------------------
-
     if len(template) != EXPECTED_SIZE:
         raise ValueError(
-            "template.bin has "
-            "unexpected size"
+            "template.bin has unexpected size"
         )
 
     if template[:4] != MAGIC:
         raise ValueError(
-            "template.bin has "
-            "unexpected magic"
+            "template.bin has unexpected magic"
         )
 
-
-    data = bytearray(
-        template
-    )
-
+    data = bytearray(template)
 
     # ------------------------------------------------------------------------
-    # Restore sensitive bytes
+    # Restore sensitive region
     # ------------------------------------------------------------------------
 
     secret = (
@@ -698,10 +605,8 @@ def encode(indir, outfile):
 
     if len(secret) != expected_secret_len:
         raise ValueError(
-            f"secrets.bin is "
-            f"{len(secret)} bytes; "
-            f"expected "
-            f"{expected_secret_len}"
+            f"secrets.bin is {len(secret)} bytes; "
+            f"expected {expected_secret_len}"
         )
 
     data[
@@ -709,9 +614,8 @@ def encode(indir, outfile):
         SECRET_END
     ] = secret
 
-
     # ------------------------------------------------------------------------
-    # Management configuration
+    # Management
     # ------------------------------------------------------------------------
 
     management = (
@@ -720,21 +624,14 @@ def encode(indir, outfile):
 
     dhcp = management["dhcp"]
 
-    if not isinstance(
-        dhcp,
-        bool,
-    ):
+    if not isinstance(dhcp, bool):
         raise ValueError(
-            "management.dhcp must "
-            "be true or false"
+            "management.dhcp must be true or false"
         )
 
     data[DHCP_OFFSET] = (
-        1
-        if dhcp
-        else 0
+        1 if dhcp else 0
     )
-
 
     data[
         IP_OFFSET:
@@ -743,7 +640,6 @@ def encode(indir, outfile):
         management["address"]
     )
 
-
     data[
         MASK_OFFSET:
         MASK_OFFSET + 4
@@ -751,14 +647,12 @@ def encode(indir, outfile):
         management["netmask"]
     )
 
-
     data[
         GW_OFFSET:
         GW_OFFSET + 4
     ] = ipv4_bytes(
         management["gateway"]
     )
-
 
     # ------------------------------------------------------------------------
     # Physical port PVIDs
@@ -774,26 +668,21 @@ def encode(indir, outfile):
 
     if len(pvids) != PVID_COUNT:
         raise ValueError(
-            f"Expected "
-            f"{PVID_COUNT} "
-            f"port PVID entries; "
+            f"Expected {PVID_COUNT} port PVID entries; "
             f"got {len(pvids)}"
         )
-
 
     for i, entry in enumerate(
         pvids
     ):
-
         value = int(
             entry["pvid"]
         )
 
         if not 0 <= value <= 4095:
             raise ValueError(
-                f"Invalid PVID "
-                f"{value} for "
-                f"port {i + 1}"
+                f"Invalid PVID {value} "
+                f"for port {i + 1}"
             )
 
         pos = (
@@ -808,7 +697,6 @@ def encode(indir, outfile):
             2,
             byteorder="big",
         )
-
 
     # ------------------------------------------------------------------------
     # Unknown VLAN-related table
@@ -827,17 +715,14 @@ def encode(indir, outfile):
         != UNKNOWN_VLAN_TABLE_COUNT
     ):
         raise ValueError(
-            f"Expected "
-            f"{UNKNOWN_VLAN_TABLE_COUNT} "
+            f"Expected {UNKNOWN_VLAN_TABLE_COUNT} "
             f"unknown table entries; "
             f"got {len(entries)}"
         )
 
-
     for i, entry in enumerate(
         entries
     ):
-
         value = int(
             entry["value"]
         )
@@ -845,8 +730,7 @@ def encode(indir, outfile):
         if not 0 <= value <= 0xFFFF:
             raise ValueError(
                 f"Invalid 16-bit value "
-                f"{value} at raw "
-                f"index {i}"
+                f"{value} at raw index {i}"
             )
 
         pos = (
@@ -862,37 +746,25 @@ def encode(indir, outfile):
             byteorder="big",
         )
 
-
     # ------------------------------------------------------------------------
     # VLAN records
     # ------------------------------------------------------------------------
 
-    vlans = (
-        config["vlans"]
-    )
+    vlans = config["vlans"]
 
     if len(vlans) != VLAN_RECORD_COUNT:
         raise ValueError(
-            f"Expected "
-            f"{VLAN_RECORD_COUNT} "
-            f"VLAN records; "
+            f"Expected {VLAN_RECORD_COUNT} VLAN records; "
             f"got {len(vlans)}"
         )
-
 
     for i, vlan in enumerate(
         vlans
     ):
-
         pos = (
             VLAN_OFFSET
             + i * VLAN_RECORD_SIZE
         )
-
-
-        # --------------------------------------------------------------------
-        # VLAN ID
-        # --------------------------------------------------------------------
 
         vid = int(
             vlan["id"]
@@ -903,11 +775,6 @@ def encode(indir, outfile):
                 f"Invalid VLAN ID {vid}"
             )
 
-
-        # --------------------------------------------------------------------
-        # VLAN name
-        # --------------------------------------------------------------------
-
         name = (
             vlan["name"]
             .encode("ascii")
@@ -915,29 +782,73 @@ def encode(indir, outfile):
 
         if len(name) > NAME_LEN:
             raise ValueError(
-                f"VLAN {vid} name "
-                f"is {len(name)} bytes; "
+                f"VLAN {vid} name is "
+                f"{len(name)} bytes; "
                 f"maximum is {NAME_LEN}"
             )
 
-
-        # --------------------------------------------------------------------
-        # Unknown metadata
-        # --------------------------------------------------------------------
-
-        metadata = (
-            parse_hex_metadata(
-                vlan[
-                    "metadata_hex"
-                ]
-            )
+        member_mask = mask_from_ports(
+            vlan["members"],
+            f"VLAN {vid} members",
         )
 
+        tagged_mask = mask_from_ports(
+            vlan["tagged"],
+            f"VLAN {vid} tagged",
+        )
 
-        # --------------------------------------------------------------------
-        # Write VLAN ID
-        # --------------------------------------------------------------------
+        if tagged_mask & ~member_mask:
+            invalid = ports_from_mask(
+                tagged_mask
+                & ~member_mask
+            )
 
+            raise ValueError(
+                f"VLAN {vid}: tagged ports "
+                f"{invalid} are not members"
+            )
+
+        preserved = (
+            vlan[
+                "metadata_preserved"
+            ]
+        )
+
+        member_word = parse_word(
+            preserved[
+                "member_word"
+            ],
+            f"VLAN {vid} member_word",
+        )
+
+        tagged_word = parse_word(
+            preserved[
+                "tagged_word"
+            ],
+            f"VLAN {vid} tagged_word",
+        )
+
+        # Preserve every unidentified bit.
+        # Modify ONLY verified front-panel-mask bits 8..16.
+        member_word = (
+            member_word
+            & ~VLAN_PORT_WORD_MASK
+        )
+
+        member_word |= (
+            member_mask << 8
+        )
+
+        tagged_word = (
+            tagged_word
+            & ~VLAN_PORT_WORD_MASK
+        )
+
+        tagged_word |= (
+            tagged_mask << 8
+        )
+
+        # Write VLAN ID.
         data[
             pos + VID_OFFSET:
             pos + VID_OFFSET + 2
@@ -946,11 +857,7 @@ def encode(indir, outfile):
             byteorder="big",
         )
 
-
-        # --------------------------------------------------------------------
-        # Write VLAN name
-        # --------------------------------------------------------------------
-
+        # Write fixed-width VLAN name.
         padded_name = (
             name
             + b"\x00"
@@ -965,37 +872,32 @@ def encode(indir, outfile):
             pos + NAME_OFFSET + NAME_LEN
         ] = padded_name
 
-
-        # --------------------------------------------------------------------
-        # Preserve VLAN metadata
-        # --------------------------------------------------------------------
-
+        # Write updated words while preserving unknown bits.
         data[
             pos + META_OFFSET:
-            pos + META_OFFSET + META_LEN
-        ] = metadata
+            pos + META_OFFSET + 4
+        ] = member_word.to_bytes(
+            4,
+            byteorder="big",
+        )
 
-
-    # ------------------------------------------------------------------------
-    # Final structural validation
-    # ------------------------------------------------------------------------
+        data[
+            pos + META_OFFSET + 4:
+            pos + META_OFFSET + 8
+        ] = tagged_word.to_bytes(
+            4,
+            byteorder="big",
+        )
 
     if len(data) != EXPECTED_SIZE:
         raise ValueError(
-            "Internal error: "
-            "output size changed"
+            "Internal error: output size changed"
         )
 
     if data[:4] != MAGIC:
         raise ValueError(
-            "Internal error: "
-            "output magic changed"
+            "Internal error: output magic changed"
         )
-
-
-    # ------------------------------------------------------------------------
-    # Write reconstructed configuration
-    # ------------------------------------------------------------------------
 
     outfile = Path(outfile)
 
@@ -1003,10 +905,7 @@ def encode(indir, outfile):
         data
     )
 
-    output_hash = (
-        sha256(data)
-    )
-
+    output_hash = sha256(data)
 
     print(
         f"Wrote: {outfile}"
@@ -1020,49 +919,28 @@ def encode(indir, outfile):
         f"SHA256: {output_hash}"
     )
 
-
-    # ------------------------------------------------------------------------
-    # Compare against original hash when available
-    # ------------------------------------------------------------------------
-
     expected_hash = (
         config
-        .get(
-            "format",
-            {},
-        )
-        .get(
-            "original_sha256"
-        )
+        .get("format", {})
+        .get("original_sha256")
     )
 
     if expected_hash:
-
         if output_hash == expected_hash:
-
             print(
-                "ROUND-TRIP MATCH: "
-                "output is byte-for-byte "
-                "identical to the original "
-                "backup."
+                "ROUND-TRIP MATCH: output is byte-for-byte "
+                "identical to the original backup."
             )
 
         else:
-
             print(
-                "Output differs from "
-                "original backup."
+                "Output differs from original backup."
             )
 
             print(
-                "This is expected if "
-                "config.json was edited."
+                "This is expected if config.json was edited."
             )
 
-
-# ============================================================================
-# Main
-# ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1074,7 +952,6 @@ def main():
         )
     )
 
-
     subparsers = (
         parser.add_subparsers(
             dest="command",
@@ -1082,46 +959,30 @@ def main():
         )
     )
 
-
-    # ------------------------------------------------------------------------
-    # Decode command
-    # ------------------------------------------------------------------------
-
     decode_parser = (
         subparsers.add_parser(
             "decode",
             help=(
-                "Decode a HORACO "
-                "configuration backup"
+                "Decode a HORACO configuration backup"
             ),
         )
     )
 
     decode_parser.add_argument(
         "bin",
-        help=(
-            "Input switch_cfg.bin"
-        ),
+        help="Input switch_cfg.bin",
     )
 
     decode_parser.add_argument(
         "outdir",
-        help=(
-            "Output directory"
-        ),
+        help="Output directory",
     )
-
-
-    # ------------------------------------------------------------------------
-    # Encode command
-    # ------------------------------------------------------------------------
 
     encode_parser = (
         subparsers.add_parser(
             "encode",
             help=(
-                "Reconstruct a HORACO "
-                "configuration backup"
+                "Reconstruct a HORACO configuration backup"
             ),
         )
     )
@@ -1129,32 +990,25 @@ def main():
     encode_parser.add_argument(
         "indir",
         help=(
-            "Directory containing "
-            "config.json, template.bin, "
-            "and secrets.bin"
+            "Directory containing config.json, "
+            "template.bin, and secrets.bin"
         ),
     )
 
     encode_parser.add_argument(
         "bin",
-        help=(
-            "Output .bin filename"
-        ),
+        help="Output .bin filename",
     )
-
 
     args = parser.parse_args()
 
-
     if args.command == "decode":
-
         decode(
             args.bin,
             args.outdir,
         )
 
     elif args.command == "encode":
-
         encode(
             args.indir,
             args.bin,
