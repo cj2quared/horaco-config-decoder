@@ -1,0 +1,11 @@
+# Real HORACO configuration/backup files
+*.bin
+config/
+private/
+.env
+*.secret
+*.secrets
+
+# Python
+__pycache__/
+*.pyc
