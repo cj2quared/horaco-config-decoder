@@ -39,6 +39,42 @@ GW_OFFSET = 0x0D
 
 
 # ============================================================================
+# Jumbo Frame
+# ============================================================================
+#
+# Verified on V100.9.9 by controlled WebUI changes.
+#
+# 0x0134 is an enum, not a literal frame size:
+#
+#   1 = 1522
+#   2 = 1536
+#   3 = 1552
+#   4 = 9216
+#   5 = 10000
+#   6 = 12000
+#
+# The vendor manual for another firmware revision shows other possible values,
+# so this mapping is deliberately scoped to the tested V100.9.9 firmware.
+# ============================================================================
+
+JUMBO_FRAME_OFFSET = 0x134
+
+JUMBO_FRAME_TYPES = {
+    1: 1522,
+    2: 1536,
+    3: 1552,
+    4: 9216,
+    5: 10000,
+    6: 12000,
+}
+
+JUMBO_FRAME_VALUES = {
+    size: raw
+    for raw, size in JUMBO_FRAME_TYPES.items()
+}
+
+
+# ============================================================================
 # Sensitive account / credential region
 # ============================================================================
 
@@ -81,6 +117,38 @@ ACCEPTED_FRAME_VALUES = {
     name: value
     for value, name in ACCEPTED_FRAME_TYPES.items()
 }
+
+
+# ============================================================================
+# Sorted VLAN internal-reference table
+# ============================================================================
+#
+# Verified through production, factory-ish, and controlled VLAN 123 backups.
+#
+# 32 uint16 big-endian entries beginning at 0x04F0.
+#
+# Internal reference:
+#
+#   0     = built-in/default VLAN 1
+#   1..31 = user VLAN record slot + 1
+#   FFFF  = unused reference
+#
+# Populated references are stored in ascending VLAN-ID order.
+#
+# Example production VLAN IDs:
+#
+#   1, 11, 14, 40, 50, 60, 70, 80
+#
+# corresponding references:
+#
+#   0, 2, 7, 5, 4, 1, 3, 6
+#
+# Controlled addition of VLAN 123 appended reference 8.
+# ============================================================================
+
+VLAN_SORT_OFFSET = 0x4F0
+VLAN_SORT_COUNT = 32
+VLAN_SORT_UNUSED = 0xFFFF
 
 
 # ============================================================================
@@ -503,6 +571,27 @@ def decode(path, outdir):
 
 
     # ------------------------------------------------------------------------
+    # Jumbo Frame
+    # ------------------------------------------------------------------------
+
+    jumbo_raw = data[
+        JUMBO_FRAME_OFFSET
+    ]
+
+    jumbo_size = (
+        JUMBO_FRAME_TYPES
+        .get(jumbo_raw)
+    )
+
+    if jumbo_size is None:
+        raise ValueError(
+            f"Unknown Jumbo Frame enum value "
+            f"{jumbo_raw} at "
+            f"0x{JUMBO_FRAME_OFFSET:04x}"
+        )
+
+
+    # ------------------------------------------------------------------------
     # Port configuration
     # ------------------------------------------------------------------------
 
@@ -560,6 +649,33 @@ def decode(path, outdir):
             "accepted_frame_type_offset":
                 f"0x{frame_pos:04x}",
         })
+
+
+    # ------------------------------------------------------------------------
+    # Sorted VLAN internal-reference table
+    # ------------------------------------------------------------------------
+
+    vlan_sorted_refs = []
+
+    for i in range(
+        VLAN_SORT_COUNT
+    ):
+        pos = (
+            VLAN_SORT_OFFSET
+            + i * 2
+        )
+
+        value = int.from_bytes(
+            data[
+                pos:
+                pos + 2
+            ],
+            byteorder="big",
+        )
+
+        vlan_sorted_refs.append(
+            value
+        )
 
 
     # ------------------------------------------------------------------------
@@ -753,10 +869,33 @@ def decode(path, outdir):
         "management":
             management,
 
+        "jumbo_frame": {
+            "bytes":
+                jumbo_size,
+
+            "raw":
+                jumbo_raw,
+
+            "offset":
+                f"0x{JUMBO_FRAME_OFFSET:04x}",
+        },
+
         "ports":
             ports,
 
         "vlan_storage": {
+            "sorted_internal_references":
+                vlan_sorted_refs,
+
+            "sorted_reference_offset":
+                f"0x{VLAN_SORT_OFFSET:04x}",
+
+            "sorted_reference_count":
+                VLAN_SORT_COUNT,
+
+            "sorted_reference_unused":
+                "0xffff",
+
             "slot_count":
                 VLAN_SLOT_COUNT,
 
@@ -791,6 +930,20 @@ def decode(path, outdir):
                 "nine sequential bytes beginning at "
                 "0x04E4: 0=all, 1=tagged, "
                 "2=untagged."
+            ),
+
+            (
+                "Jumbo Frame is an enum at 0x0134. "
+                "Observed V100.9.9 values are "
+                "1=1522, 2=1536, 3=1552, "
+                "4=9216, 5=10000, 6=12000."
+            ),
+
+            (
+                "A 32-entry sorted VLAN internal-reference "
+                "table begins at 0x04F0. Reference 0 is "
+                "default VLAN 1; references 1..31 correspond "
+                "to user VLAN record slots 0..30."
             ),
 
             (
@@ -1001,6 +1154,34 @@ def encode(indir, outfile):
         GW_OFFSET + 4
     ] = ipv4_bytes(
         management["gateway"]
+    )
+
+
+    # ------------------------------------------------------------------------
+    # Jumbo Frame
+    # ------------------------------------------------------------------------
+
+    jumbo_size = int(
+        config[
+            "jumbo_frame"
+        ][
+            "bytes"
+        ]
+    )
+
+    if jumbo_size not in JUMBO_FRAME_VALUES:
+        raise ValueError(
+            f"Invalid Jumbo Frame size "
+            f"{jumbo_size}. Expected one of: "
+            f"{sorted(JUMBO_FRAME_VALUES)}"
+        )
+
+    data[
+        JUMBO_FRAME_OFFSET
+    ] = (
+        JUMBO_FRAME_VALUES[
+            jumbo_size
+        ]
     )
 
 
@@ -1401,6 +1582,77 @@ def encode(indir, outfile):
             pos + META_OFFSET + 8
         ] = tagged_word.to_bytes(
             4,
+            byteorder="big",
+        )
+
+
+    # ------------------------------------------------------------------------
+    # Validate sorted VLAN internal-reference table
+    # ------------------------------------------------------------------------
+
+    expected_sorted_refs = [
+        0
+    ]
+
+    sorted_user_vlans = sorted(
+        vlans,
+        key=lambda vlan: int(
+            vlan["id"]
+        ),
+    )
+
+    expected_sorted_refs.extend(
+        int(vlan["slot"]) + 1
+        for vlan in sorted_user_vlans
+    )
+
+    if len(expected_sorted_refs) > VLAN_SORT_COUNT:
+        raise ValueError(
+            "Too many VLAN references for "
+            "sorted VLAN table"
+        )
+
+    expected_sorted_refs.extend(
+        [VLAN_SORT_UNUSED]
+        * (
+            VLAN_SORT_COUNT
+            - len(expected_sorted_refs)
+        )
+    )
+
+    original_sorted_refs = (
+        config[
+            "vlan_storage"
+        ][
+            "sorted_internal_references"
+        ]
+    )
+
+    if (
+        len(original_sorted_refs)
+        != VLAN_SORT_COUNT
+    ):
+        raise ValueError(
+            "sorted_internal_references "
+            "must contain 32 entries"
+        )
+
+    # Current encoder still forbids VLAN slot creation/deletion, but permits
+    # editing existing VLAN IDs. Therefore rebuild the sorted table from the
+    # edited VIDs and stable internal slot references.
+    for i, value in enumerate(
+        expected_sorted_refs
+    ):
+        pos = (
+            VLAN_SORT_OFFSET
+            + i * 2
+        )
+
+        data[
+            pos:
+            pos + 2
+        ] = value.to_bytes(
+            2,
             byteorder="big",
         )
 
